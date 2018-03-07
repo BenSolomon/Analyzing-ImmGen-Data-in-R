@@ -1,0 +1,225 @@
+---
+title: "Analyzing ImmGen Data in R"
+output: html_document
+---
+
+###Reading data from GEO
+
+
+**Gene Expression Omnibus (GEO) database**
+
+* GEO is a database for public hosting of gene expression data sets
+* There are 4 types of GEO data formats
+    * GEO Platform (GPL) - annotation files describing a particular type of microarray
+    * GEO Sample (GSM) - data from a single microarray chip
+    * GEO Series (GSE) - list of GSM files from a single experiment
+    * GEO DataSet (GDS) - summarized combination of GSE and GSM files, with normalized expression levels
+
+**ImmGenn on GEO**
+
+* All ImmGen data is available on GEO at [http://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE15907](http://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE15907)
+* The entire ImmGen project is represented as GSE15907
+    * GSM files representing individual microarray data sets are also hosted and are linked on the GSE page
+
+```{r, message = F, warning=F, cache = T, indent = '    '}
+library(Biobase); library(GEOquery); library(org.Mm.eg.db)
+gse <- getGEO("GSE15907")
+gseES <- gse[[1]] #getGEO actually reads in data as a one element list that must be subsetted 
+gseES
+```
+
+    * `getGEO` default is to read GSE in as an `ExpressionSet`
+        * This can be changed to native GEOquery class with `GSEMatrix=FALSE` argument
+
+**ExpressionSet object in Bioconductor**
+
+* `ExpressionSets` are a general class in Bioconductor used to link many aspects of expression data together
+* There are several broad components of an `ExpressionSet`
+    * `assayData` - the matrix of expression data, can be accessed by `exprs()`
+    
+```{r, message = F, warning = F, cache = T, indent = '        '}
+exprs(gseES)[1:5,1:5]
+```
+
+    * `phenoData` - an `AnnotatedDataFrame` of variables describing the phenotype of each sample, can be accessed by `pData()`
+        
+```{r, message = F, warning = F, cache = T, indent = '        '}
+names(pData(gseES))  #also varLabels(gseES)
+sampleNames(gseES)[1:5] #equivalent to geo_accession column of pData
+```
+
+    * `featureData` - an `AnnotatedDataFrame` of variables describing each probe, can be accessed  by `fData()`
+
+```{r, message = F, warning = F, cache = T, indent = '        '}
+names(fData(gseES))
+featureNames(gseES)[1:5] #equivalent to ID column of fData
+```
+        
+    * `annotation` - information about the expression platform used (i.e. how the probe set can be annotated), typically a GPL file name
+    * `experimentData` - text description of the expression set, typically in "MIAME" format
+
+**Annotating ImmGen data**
+
+* Many GEO databases contain annotation where probeIDs are clearly correlated to individual genes
+* However in ImmGen GSE15907, annotation data is in a more complicated format
+* Accession numbers are contained in `GB_LIST` column of `featureData`
+    * For each probeID, `GB_LIST` has a string of accession numbers corresponding to each database that the associated gene has an entry in
+    * The first entry is typically for NCBI's GeneBank DB (e.g "NM_...")
+    * However, some probeIDs will even have multiple accession numbers from the same database
+        * This usually indicates alternative splice forms that a given probeID can't distinguish between
+```{r, message = F, cache = T, indent = '    '}
+as.character(head(fData(gseES)$GB_LIST))[1:3]
+```
+* `gene_assignment` contains string of annotation for each accession number available for a given probe
+    * However, this string can be hard to parse 
+```{r, message = F, cache = T, indent = '    '}
+as.character(head(fData(gseES)$gene_assignment))[1:3]
+```
+
+* Alternative strategy would be to first available GeneBank accession number for a probeID and use that as a key to query and annotation database
+
+```{r, message = F, cache = T, indent = '    '}
+library(org.Mm.eg.db)
+#Separate each GB_LIST entry into a vector of accession numbers, contained as elements in a list
+gbList <- strsplit(as.character(fData(gseES)$GB_LIST), ",") 
+#Find the first GeneBank ID in each vector element of the list
+gb <- sapply(gbList, function(x) (x[grepl("NM", x)])[1]) 
+#Uses the org.Mm.eg.db to lookup probes by GeneBank accession number and return a gene symbol
+sym <- select(org.Mm.eg.db, keys=gb, columns=c("SYMBOL"), keytype=c("ACCNUM")) 
+#Adds the gene symbol to the phenoData
+fData(gseES) <- cbind(fData(gseES), sym) 
+head(fData(gseES)[,c("GB_LIST", "ACCNUM", "SYMBOL")])
+```
+
+###Pre-processing ImmGen Data
+
+* The expression data in the ImmGen GSE file needs to be log-transformed
+```{r, message = F, cache = T, indent = '    '}
+exprs(gseES) <- log(exprs(gseES))
+```
+
+* However, ImmGen GSE file *is* already pre-normalized
+```{r, message = F, cache = F, indent = '    '}
+library(lumi)
+boxplot(gseES)
+```
+
+
+
+###Differential gene expression
+
+**Theory of the Limma package**
+
+* Differential gene expression is a multiple testing problem
+    * The more genes you test for differential expression, the more likely you are to find a gene that meets a significance threshold by chance
+    * Normal approach would be to control the family wise error rate with a false discovery rate correction
+        * E.g. Bonferonni or Benjamini-Hochberg
+    * However a problem still remains that genes with smaller expression levels will have smaller standard errors and a a higher chance of acheiving significance
+* Two fundamental components of the Limma methodology
+    1) Use a linear model to describe the expression of each gene in terms of all different sample conditions
+        * $expression_{gene} = /alpha_0 * condition_1 + ... /alpha_n * condition_n + error$
+    2) Use empirical Bayesian analysis to "shrink" standard error of any gene toward the mean of all gene variance
+        * Having a very small or very large SE is unlikely, so correct the SE based on its likelihood
+* Thus, Limma "borrows" power from the population of genes in the statistical test of a single gene
+
+
+**Analysis of Two-Group comparisons**
+
+* Subsetting ImmGen expressionSet to just to types of samples
+    * Comparing the splenic CD4+Foxp3- and CD4+Foxp3+CD25+ populations
+```{r, message = F, cache = T, indent = '    '}
+gseES$population <- sapply(strsplit(as.character(gseES$title),"#"), function(x) x[1])
+gseES.sub <- gseES[, gseES$population == "T.4FP3-.Sp" | gseES$population == "T.4FP3+25+.Sp"]
+show(gseES.sub)
+```
+
+* Creating the model matrix
+```{r, message = F, cache = T, indent = '    '}
+samples <- gseES.sub$population
+design <- model.matrix(~factor(samples))
+lv <- levels(factor(samples))
+colnames(design) <- c(lv[1], paste0(lv[1],"_",lv[2]))
+design
+```
+
+* Using `limma` to calculate differential gene expression
+```{r, message = F, cache = T, indent = '    '}
+library(limma)
+fit <- lmFit(gseES.sub, design)
+fit <- eBayes(fit)
+```
+
+* Listing top genes
+```{r, message = F, cache = T, indent = '    '}
+topTable(fit, coef = 2, n=10, adjust="BH", genelist = fit$genes$SYMBOL, sort.by="logFC", p.value = 0.05)
+```
+
+* Heatmap of top genes
+```{r, message = F, cache = T, indent = '    '}
+library(gplots)
+selected <- p.adjust(fit$p.value[, 2]) <0.05
+gseES.sub.selected <- gseES.sub[selected, ]
+heatmap.2(exprs(gseES.sub.selected),
+          trace = "none",
+          margins = c(10,10),
+          labCol = gseES.sub.selected$population,
+          cexCol=1.5)
+```
+
+* Volcano plot of differential gene expression
+```{r, message = F, cache = T, indent = '    '}
+volcanoplot(fit, coef=2, highlight=10, names=fit$genes$SYMBOL)
+```
+
+* Finding results for a specific gene
+```{r, message = F, cache = T, indent = '    '}
+allGenes <- topTable(fit, coef = 2, n=Inf, adjust="BH", genelist = fit$genes$SYMBOL)
+allGenes[(allGenes$ID == "Foxp3") & !is.na(allGenes$ID),]
+```
+
+
+
+**Analysis of Many-Group comparisons**
+
+
+###Working with raw ImmGen sample data
+
+**Getting GSM files**
+
+* The ImmGen GSE file contains expression data from all ImmGen experiments
+* However, this means that all individual samples have already been normalized prior to inclusion in the GSE
+* You may want to apply your own pre-processing in order to best compare ImmGen data to your own expression data
+* This will require downloading the component GSM files from the ImmGen GSE
+* Getting all GSM files
+    * From the GSE file, it is simple to download all associated GSM files
+    * However, for the ImmGen data base, this is a lot of data and will take a while to download
+    * May not be necessary if you are only interested in a few particular samples
+```{r, message = F, cache = T, indent = '    ', eval = F}
+getGEOSuppFiles("GSE15907") #2.7Gb zipped file
+```
+
+* Getting specific GSM files
+    * Alternative, you can determine which specific GSM files you want and download them specifically
+```{r, message = F, cache = T, indent = '    ', eval = F}
+sample <- "T.4+8int.Th#1"
+gsm <- as.character(pData(gseES)$geo_accession[pData(gseES)$title == sample]) #Finds the gsm for the indicated sample
+gsm <- getGEO(gsm) #Downloads gsm from GEO 
+```
+
+**Setting up GSM files**
+
+* If all supporting GSM files were downloaded 
+```{r, message = F, cache = T, indent = '    ', eval = F}
+untar("GSE15907/GSE15907_RAW.tar", exdir="data")
+```
+
+
+```{r, message = F, cache = T, eval = F}
+#Required packages
+source("https://bioconductor.org/biocLite.R")
+biocLite()
+biocLite(c("GEOquery", "org.Mm.eg.db", "limma"))
+```
+Linear Models and Empirical Bayes Methods for Assessing Differential Expression in Microarray Experiments
+
+https://www.bioconductor.org/help/course-materials/2009/BioC2009/labs/limma/limma.pdf
